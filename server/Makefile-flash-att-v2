@@ -3,11 +3,11 @@ flash_att_v2_commit := 4f285b354796fb17df8636485b9a04df3ebbb7dc
 flash-attention-v2:
     # Clone flash attention
 	pip install packaging
-	git clone https://github.com/HazyResearch/flash-attention.git flash-attention-v2
+	git clone https://ghproxy.com/https://github.com/HazyResearch/flash-attention.git flash-attention-v2
 
 build-flash-attention-v2: flash-attention-v2
 	cd flash-attention-v2 && git fetch && git checkout $(flash_att_v2_commit)
-	cd flash-attention-v2 && python setup.py build
+	cd flash-attention-v2 && find -type f -exec sed -i 's,https://github.com/,https://ghproxy.com/https://github.com/,g' {} + && python setup.py build
 
 install-flash-attention-v2: build-flash-attention-v2
 	cd flash-attention-v2 && python setup.py install

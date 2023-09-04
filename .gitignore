@@ -2,3 +2,5 @@
 target
 router/tokenizer.json
 *__pycache__*
+data
+cache

@@ -4,6 +4,12 @@ WORKDIR /usr/src
 
 ARG CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
+# cargo 国内镜像加速
+RUN mkdir -p .cargo
+COPY config.toml .cargo/
+ENV RUSTUP_DIST_SERVER="https://mirrors.ustc.edu.cn/rust-static"
+ENV RUSTUP_UPDATE_ROOT="https://mirrors.ustc.edu.cn/rust-static/rustup"
+
 FROM chef as planner
 COPY Cargo.toml Cargo.toml
 COPY rust-toolchain.toml rust-toolchain.toml
@@ -19,7 +25,7 @@ ARG GIT_SHA
 ARG DOCKER_LABEL
 
 RUN PROTOC_ZIP=protoc-21.12-linux-x86_64.zip && \
-    curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v21.12/$PROTOC_ZIP && \
+    curl --progress-bar -OL https://ghproxy.com/https://github.com/protocolbuffers/protobuf/releases/download/v21.12/$PROTOC_ZIP && \
     unzip -o $PROTOC_ZIP -d /usr/local bin/protoc && \
     unzip -o $PROTOC_ZIP -d /usr/local 'include/*' && \
     rm -f $PROTOC_ZIP
@@ -37,19 +43,23 @@ RUN cargo build --release
 
 # Python builder
 # Adapted from: https://github.com/pytorch/pytorch/blob/master/Dockerfile
-FROM debian:bullseye-slim as pytorch-install
+FROM nvidia/cuda:11.8.0-base-ubuntu20.04 as pytorch-install
 
 ARG PYTORCH_VERSION=2.0.1
 ARG PYTHON_VERSION=3.9
 # Keep in sync with `server/pyproject.toml
 ARG CUDA_VERSION=11.8
-ARG MAMBA_VERSION=23.1.0-1
-ARG CUDA_CHANNEL=nvidia
-ARG INSTALL_CHANNEL=pytorch
 # Automatically set by buildx
 ARG TARGETPLATFORM
 
 ENV PATH /opt/conda/bin:$PATH
+
+# 检测显卡
+RUN nvidia-smi -L || { echo "未检测到显卡,如果显卡正确配置,使用DOCKER_BUILDKIT=0重新build"; exit 1; }
+
+# 使用国内源加速
+RUN sed -i "s@\(archive\|security\).ubuntu.com@mirrors.aliyun.com@g" /etc/apt/sources.list
+RUN echo >>/etc/apt/apt.conf.d/99verify-peer.conf "Acquire { https::Verify-Peer false }"
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential \
@@ -59,25 +69,28 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         git && \
         rm -rf /var/lib/apt/lists/*
 
+# conda 国内镜像加速
+COPY .condarc /root/.condarc
+
 # Install conda
 # translating Docker's TARGETPLATFORM into mamba arches
 RUN case ${TARGETPLATFORM} in \
          "linux/arm64")  MAMBA_ARCH=aarch64  ;; \
          *)              MAMBA_ARCH=x86_64   ;; \
     esac && \
-    curl -fsSL -v -o ~/mambaforge.sh -O  "https://github.com/conda-forge/miniforge/releases/download/${MAMBA_VERSION}/Mambaforge-${MAMBA_VERSION}-Linux-${MAMBA_ARCH}.sh"
+    curl --progress-bar -fsSL -v -o ~/mambaforge.sh -O  "https://ghproxy.com/https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-Linux-${MAMBA_ARCH}.sh"
 RUN chmod +x ~/mambaforge.sh && \
     bash ~/mambaforge.sh -b -p /opt/conda && \
     rm ~/mambaforge.sh
 
-# Install pytorch
-# On arm64 we exit with an error code
-RUN case ${TARGETPLATFORM} in \
-         "linux/arm64")  exit 1 ;; \
-         *)              /opt/conda/bin/conda update -y conda &&  \
-                         /opt/conda/bin/conda install -c "${INSTALL_CHANNEL}" -c "${CUDA_CHANNEL}" -y "python=${PYTHON_VERSION}" pytorch==$PYTORCH_VERSION "pytorch-cuda=$(echo $CUDA_VERSION | cut -d'.' -f 1-2)"  ;; \
-    esac && \
-    /opt/conda/bin/conda clean -ya
+RUN /opt/conda/bin/conda install -n base conda-libmamba-solver && /opt/conda/bin/conda clean -ya
+RUN /opt/conda/bin/conda config --set solver libmamba && /opt/conda/bin/conda clean -ya
+RUN /opt/conda/bin/conda install -y "python=${PYTHON_VERSION}" -c conda-forge && /opt/conda/bin/conda clean -ya
+
+# Install pytorch adn cuda
+RUN /opt/conda/bin/conda install -c "nvidia/label/cuda-11.8.0" -c torch -c nvidia -y pytorch==$PYTORCH_VERSION pytorch-cuda=$CUDA_VERSION cuda==$CUDA_VERSION && /opt/conda/bin/conda clean -ya
+
+ENV CUDA_HOME='/opt/conda'
 
 # CUDA kernels builder image
 FROM pytorch-install as kernel-builder
@@ -86,8 +99,14 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         ninja-build \
         && rm -rf /var/lib/apt/lists/*
 
-RUN /opt/conda/bin/conda install -c "nvidia/label/cuda-11.8.0"  cuda==11.8 && \
-    /opt/conda/bin/conda clean -ya
+# pip 国内加速
+RUN pip config set global.index-url https://mirrors.tencentyun.com/pypi/simple
+
+# fix fatal error: pybind11/pybind11.h: No such file or directory
+RUN pip install "pybind11[global]" --no-cache-dir
+
+# 检查 cuda 是否可用
+RUN python -c "import torch;print('CUDA is READY') if torch.cuda.is_available() else exit(0)"
 
 # Build Flash Attention CUDA kernels
 FROM kernel-builder as flash-att-builder
@@ -95,6 +114,8 @@ FROM kernel-builder as flash-att-builder
 WORKDIR /usr/src
 
 COPY server/Makefile-flash-att Makefile
+
+RUN ls /opt/conda
 
 # Build specific version of flash attention
 RUN make build-flash-attention
@@ -115,7 +136,6 @@ FROM kernel-builder as exllama-kernels-builder
 WORKDIR /usr/src
 
 COPY server/exllama_kernels/ .
-
 
 # Build specific version of transformers
 RUN TORCH_CUDA_ARCH_LIST="8.0;8.6+PTX" python setup.py build
@@ -154,6 +174,10 @@ ENV HUGGINGFACE_HUB_CACHE=/data \
 
 WORKDIR /usr/src
 
+# 设置为中国国内源
+RUN sed -i "s@\(archive\|security\).ubuntu.com@mirrors.aliyun.com@g" /etc/apt/sources.list
+RUN echo >>/etc/apt/apt.conf.d/99verify-peer.conf "Acquire { https::Verify-Peer false }"
+
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libssl-dev \
         ca-certificates \
@@ -179,17 +203,12 @@ COPY --from=exllama-kernels-builder /usr/src/build/lib.linux-x86_64-cpython-39 /
 # Copy builds artifacts from vllm builder
 COPY --from=vllm-builder /usr/src/vllm/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
 
+# pip 国内加速
+RUN pip config set global.index-url https://mirrors.tencentyun.com/pypi/simple
+
 # Install flash-attention dependencies
 RUN pip install einops --no-cache-dir
 
-# Install server
-COPY proto proto
-COPY server server
-COPY server/Makefile server/Makefile
-RUN cd server && \
-    make gen-server && \
-    pip install -r requirements.txt && \
-    pip install ".[bnb, accelerate, quantize]" --no-cache-dir
 
 # Install benchmarker
 COPY --from=builder /usr/src/target/release/text-generation-benchmark /usr/local/bin/text-generation-benchmark
@@ -202,6 +221,23 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         build-essential \
         g++ \
         && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        g++ \
+        && rm -rf /var/lib/apt/lists/*
+
+# for qwen int4 model
+RUN pip install auto-gptq tiktoken transformers_stream_generator --no-cache-dir
+
+# Install server
+COPY proto proto
+COPY server server
+COPY server/Makefile server/Makefile
+RUN cd server && \
+    make gen-server && \
+    pip install -r requirements.txt --no-cache-dir && \
+    pip install ".[bnb, accelerate, quantize]" --no-cache-dir
 
 # AWS Sagemaker compatbile image
 FROM base as sagemaker

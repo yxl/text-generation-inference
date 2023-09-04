@@ -1,0 +1,29 @@
+version: '3'
+services:
+  text-generation-inference-server:
+    image: yxl/text-generation-inference-server:qwen-0.0.1
+    # 用于通过 docker-compose build 构建本地测试镜像
+    build:
+      context: .
+    command: --model-id Qwen-7B-Chat-Int4 --trust-remote-code
+    restart: always
+    # 对外暴露的端口号
+    ports:
+      - "8080:80"
+    volumes:
+      # 模型等数据挂载目录，默认为当前项目的 data 目录
+      - ./data/Qwen-7B-Chat-Int4:/usr/src/Qwen-7B-Chat-Int4
+      # huggingface 模型缓存目录
+      - ./cache/:/root/.cache/
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '2' ]
+              capabilities: [ gpu ]
+    logging:
+      driver: json-file
+      options:
+          max-size: "100m"
+          max-file: "5"

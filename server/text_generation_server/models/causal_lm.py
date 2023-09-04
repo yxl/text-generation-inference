@@ -502,30 +502,21 @@ class CausalLM(Model):
             truncation_side="left",
             trust_remote_code=trust_remote_code,
         )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            revision=revision,
+            torch_dtype=dtype,
+            device_map="auto"
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1
+            else None,
+            load_in_8bit=quantize == "bitsandbytes",
+            trust_remote_code=trust_remote_code,
+        )
         if 'qwen' in model_id.lower():
-            model = AutoGPTQForCausalLM.from_quantized(
-                model_id,
-                device_map="auto"
-                if torch.cuda.is_available() and torch.cuda.device_count() > 1
-                else None,
-                use_safetensors = True,
-                trust_remote_code=True,
-            )
             QWEN_EOS_TOKEN_ID = 151643
             tokenizer.pad_token_id = QWEN_EOS_TOKEN_ID
             model.config.pad_token_id = QWEN_EOS_TOKEN_ID
             model.config.eos_token_id = QWEN_EOS_TOKEN_ID
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                revision=revision,
-                torch_dtype=dtype,
-                device_map="auto"
-                if torch.cuda.is_available() and torch.cuda.device_count() > 1
-                else None,
-                load_in_8bit=quantize == "bitsandbytes",
-                trust_remote_code=trust_remote_code,
-            )
         if torch.cuda.is_available() and torch.cuda.device_count() == 1:
             model = model.cuda()
 
